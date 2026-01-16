@@ -34,7 +34,6 @@ class CoverageBuilder:
         Args:
             target: Target programs with args in a callable form.
         """
-        # Create coverage command
         afl_path = os.environ.get("AFL_PATH", ".")
         self.command = [
             os.path.join(afl_path, "afl-showmap"),
@@ -51,7 +50,6 @@ class CoverageBuilder:
         try:
             self._seed_position = self.command.index("@@")
         except ValueError:
-            # If `@@` is not supplied, add it at the end of the command
             self.command.append("@@")
             self._seed_position = len(self.command) - 1
 
@@ -59,12 +57,6 @@ class CoverageBuilder:
         """
         Generate the command to call for extracting the desired type of coverage
         for the seed provided as input.
-
-        Args:
-            seed: Path to seed file.
-
-        Returns:
-            Command to call in iterable format.
         """
         self.command[self._seed_position] = str(seed)
         return self.command
@@ -76,43 +68,45 @@ def create_path_coverage_bitmap(
 ) -> Dict[pathlib.Path, Optional[Set[int]]]:
     """
     Create edge coverage bitmaps for each seed in `seed_list`.
-
-    Bitmaps are extracted using the external command `afl-showmap`.
-    Only edges that were already reached will be present in the bitmap.
-
-    Args:
-        target_with_args: Command line arguments used to invoke the training script.
-        seed_list: List of paths containing the seeds for which bitmaps need to be extracted.
-
-    Returns:
-        Mapping of seed names to covered blocks of code in the target program.
-        The covered blocks are identified via integer IDs.
     """
     logger.info("Creating edge coverage bitmaps.")
     raw_bitmap: Dict[pathlib.Path, Optional[Set[int]]] = {}
-    out: bytes
     cov_tool = CoverageBuilder(target_with_args)
 
     has_failed_seeds = False
     for seed in seed_list:
         try:
-            edges_curr_seed: Set[int] = set()
             command = cov_tool.get_command_for_seed(seed)
-            out = subprocess.check_output(command)
 
-            for line in out.splitlines():
-                edge = int(line.split(b":")[0])
+            # Use subprocess.run for better control (timeout, stderr capture)
+            # NOTE: afl-showmap has its own -t timeout, but this guards against hangs anyway.
+            proc = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=30,  # conservative guard; adjust if needed
+            )
+
+            edges_curr_seed: Set[int] = set()
+            for line in proc.stdout.splitlines():
+                # format: b"12345:1" -> take left side
+                edge = int(line.split(b":", 1)[0])
                 edges_curr_seed.add(edge)
+
             raw_bitmap[seed] = edges_curr_seed
-        except subprocess.CalledProcessError as err:
+
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
             raw_bitmap[seed] = None
             has_failed_seeds = True
-            logger.error(f"Bitmap extraction failed: {err}")
+            logger.error(f"Bitmap extraction failed for {seed}: {err}")
 
     if has_failed_seeds:
         seed_list, raw_bitmap = _clean_seed_list(seed_list, raw_bitmap)
+
     if not seed_list:
         raise ValueError("No valid seed labels were produced. Stopping.")
+
     return raw_bitmap
 
 
@@ -122,25 +116,29 @@ def create_bitmap_from_raw_coverage(
     """
     Given raw coverage information for seeds, create a compact and compressed
     coverage bitmap.
-
-    Args:
-        raw_bitmap: Mapping of seed names to covered blocks in the target program.
-            The covered blocks are identified via integer IDs.
-
-    Returns:
-        * Ordered seed list corresponding to the compressed bitmap.
-        * Numpy array containing the "reduced" coverage bitmap for all seeds.
-        The bitmap is reduced by merging together the edges (columns) that have identical coverage
-        under the existing seeds.
     """
     seed_list = list(raw_bitmap.keys())
-    all_edges = set.union(*raw_bitmap.values())
+    if not seed_list:
+        raise ValueError("Empty raw bitmap: no seeds to process.")
+
+    # Robust union (safe even if some sets are empty)
+    all_edges: Set[int] = set()
+    for s in raw_bitmap.values():
+        all_edges |= set(s)
+
+    if not all_edges:
+        # All seeds produced empty coverage -> bitmap is all zeros, keep shape stable
+        cov_bitmap = np.zeros((len(seed_list), 0), dtype=bool)
+        reduced_bitmap = cov_bitmap
+        logger.info(f"Bitmap reduced from {str(cov_bitmap.shape)} to {str(reduced_bitmap.shape)}")
+        return seed_list, reduced_bitmap
+
     all_edges_indices = {addr: index for index, addr in enumerate(all_edges)}
     cov_bitmap = np.zeros((len(seed_list), len(all_edges)), dtype=bool)
+
     for seed_idx, seed in enumerate(seed_list):
         for addr in raw_bitmap[seed]:
             cov_bitmap[seed_idx][all_edges_indices[addr]] = True
-    del all_edges, all_edges_indices
 
     reduced_bitmap = remove_identical_coverage(cov_bitmap)
     assert len(seed_list) == reduced_bitmap.shape[0]
@@ -151,13 +149,6 @@ def remove_identical_coverage(bitmap: np.ndarray, keep_unseen: bool = False) -> 
     """
     Reduce a coverage bitmap by merging together all edge coverage with identical
     coverage under all seeds.
-
-    Args:
-        bitmap: Boolean coverage bitmap, where each row is a seed and each column an edge.
-        keep_unseen: True if unseen addressed or edges (columns of zeroes) should be left intact.
-
-    Returns:
-        Reduced bitmap.
     """
     if keep_unseen:
         mask = np.sum(bitmap, axis=0) == 0
@@ -171,17 +162,27 @@ def remove_identical_coverage(bitmap: np.ndarray, keep_unseen: bool = False) -> 
     return reduced_bitmap
 
 
-def _clean_seed_list(seed_list, raw_bitmap):
+def _clean_seed_list(
+    seed_list: List[pathlib.Path],
+    raw_bitmap: Dict[pathlib.Path, Optional[Set[int]]],
+) -> Tuple[List[pathlib.Path], Dict[pathlib.Path, Set[int]]]:
     logger.info("Removing failed seeds from dataset.")
+    cleaned: List[pathlib.Path] = []
     n_removed = 0
-    for seed in reversed(seed_list):
-        if raw_bitmap[seed] is None:
-            del raw_bitmap[seed]
-            seed_list.remove(seed)
+
+    for seed in seed_list:
+        if raw_bitmap.get(seed) is None:
             n_removed += 1
+        else:
+            cleaned.append(seed)
+
+    # Remove failed from dict, keep only good ones
+    raw_bitmap_clean: Dict[pathlib.Path, Set[int]] = {
+        k: v for k, v in raw_bitmap.items() if v is not None
+    }
 
     logger.info(f"Successfully removed {n_removed} seeds.")
-    assert len(seed_list) == len(
-        raw_bitmap
-    ), f"The number of seeds and labels do not match: {len(seed_list)}, {len(raw_bitmap)}"
-    return seed_list, raw_bitmap
+    assert len(cleaned) == len(raw_bitmap_clean), (
+        f"The number of seeds and labels do not match: {len(cleaned)}, {len(raw_bitmap_clean)}"
+    )
+    return cleaned, raw_bitmap_clean

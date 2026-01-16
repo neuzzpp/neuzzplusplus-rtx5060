@@ -36,8 +36,7 @@ from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from neuzzpp.data_loaders import CoverageSeedHandler, SeedFolderHandler, seed_data_generator
 from neuzzpp.models import MLP, create_logits_model
 from neuzzpp.mutations import compute_one_mutation_info
-from neuzzpp.utils import (LRTensorBoard, create_work_folders,
-                           model_needs_retraining)
+from neuzzpp.utils import LRTensorBoard, create_work_folders, model_needs_retraining
 
 # Configure logger - console
 logger = logging.getLogger("neuzzpp")
@@ -106,14 +105,14 @@ def train_model(args: argparse.Namespace, seed_handler: SeedFolderHandler):
         fast=args.fast,
     )
 
-    # Fit model
+    # Fit model (Keras требует int для steps_per_epoch / validation_steps)
     model.model.fit(
         training_generator,
-        steps_per_epoch=np.ceil(seed_handler.training_size / args.batch_size),
+        steps_per_epoch=int(np.ceil(seed_handler.training_size / args.batch_size)),
         validation_data=validation_generator,
         validation_steps=None
         if validation_generator is None
-        else np.ceil(seed_handler.val_size / args.batch_size),
+        else int(np.ceil(seed_handler.val_size / args.batch_size)),
         epochs=args.epochs,
         callbacks=callbacks,
         verbose=2,
@@ -121,12 +120,12 @@ def train_model(args: argparse.Namespace, seed_handler: SeedFolderHandler):
 
     # Compute evaluation metrics on validation data
     if args.val_split > 0.0:
-        class_threshold = 0.5  # Classification threshold, use default of 0.5
+        class_threshold = 0.5
         val_gen = seed_data_generator(
             *seed_handler.val_set, args.batch_size, seed_handler.max_file_size
         )
         preds_val = model.model.predict(
-            val_gen, steps=np.ceil(seed_handler.val_size / args.batch_size)
+            val_gen, steps=int(np.ceil(seed_handler.val_size / args.batch_size))
         )
         y_true = seed_handler.val_set[1]
         y_pred = preds_val > class_threshold
@@ -139,7 +138,12 @@ def train_model(args: argparse.Namespace, seed_handler: SeedFolderHandler):
         assert tp.shape[0] == tn.shape[0] == fp.shape[0] == fn.shape[0] == y_true.shape[1]
         prec = np.divide(tp, tp + fp, out=np.zeros_like(tp, dtype=np.float64), where=(tp + fp) != 0)
         recall = np.divide(tp, tp + fn, out=np.zeros_like(tp, dtype=np.float64), where=(tp + fn) != 0)
-        f1 = np.divide(2 * tp, 2 * tp + fp + fn, out=np.zeros_like(tp, dtype=np.float64), where=(tp + fp + fn) != 0)
+        f1 = np.divide(
+            2 * tp,
+            2 * tp + fp + fn,
+            out=np.zeros_like(tp, dtype=np.float64),
+            where=(tp + fp + fn) != 0,
+        )
         prc = tf.keras.metrics.AUC(curve="PR", multi_label=True, num_labels=y_true.shape[1])
         prc.update_state(y_true, y_pred)
         print(
@@ -150,33 +154,20 @@ def train_model(args: argparse.Namespace, seed_handler: SeedFolderHandler):
 
 
 def create_parser() -> argparse.ArgumentParser:
-    """
-    Create and return the parser instance for the CLI arguments.
-
-    Returns:
-        Parser object.
-    """
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("-l", "--max_len", help="maximum seed length", type=int, default=None)
     parser.add_argument(
         "-p",
         "--percentile_len",
-        help="percentile of seed length to keep as maximum seed length (1-100); "
-        "ignored if max_len is provided",
+        help="percentile of seed length to keep as maximum seed length (1-100); ignored if max_len is provided",
         type=int,
         default=80,
     )
-    parser.add_argument(
-        "-e", "--epochs", help="number of epochs for model training", type=int, default=100
-    )
-    parser.add_argument(
-        "-b", "--batch_size", help="batch size for model training", type=int, default=32
-    )
+    parser.add_argument("-e", "--epochs", help="number of epochs for model training", type=int, default=100)
+    parser.add_argument("-b", "--batch_size", help="batch size for model training", type=int, default=32)
     parser.add_argument("--lr", help="learning rate", type=float, default=1e-4)
     parser.add_argument("-s", "--early_stopping", help="early stopping patience", type=int)
-    parser.add_argument(
-        "--n_hidden_neurons", help="number of neurons in hidden layer", type=int, default=4096
-    )
+    parser.add_argument("--n_hidden_neurons", help="number of neurons in hidden layer", type=int, default=4096)
     parser.add_argument(
         "-v",
         "--val_split",
@@ -184,9 +175,7 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
     )
-    parser.add_argument(
-        "-r", "--random_seed", help="seed for random number generator", type=int, default=None
-    )
+    parser.add_argument("-r", "--random_seed", help="seed for random number generator", type=int, default=None)
     parser.add_argument(
         "-f",
         "--fast",
@@ -199,14 +188,12 @@ def create_parser() -> argparse.ArgumentParser:
         "--cov",
         help="type of coverage to measure",
         type=str,
-        choices=["edge"],  # Only edge coverage supported for now
+        choices=["edge"],
         default="edge",
     )
     parser.add_argument("input_pipe", help="", type=str)
     parser.add_argument("output_pipe", help="", type=str)
-    parser.add_argument(
-        "seeds", help="path to seeds folder, usually named `queue` for AFL++", type=str
-    )
+    parser.add_argument("seeds", help="path to seeds folder, usually named `queue` for AFL++", type=str)
     parser.add_argument(
         "target",
         help="target program and arguments",
@@ -217,6 +204,17 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _normalize_seed_name(raw: str) -> str:
+    """
+    AFL/mutator может прислать '/id:....' (абсолютный путь от корня) или 'queue/id:...'.
+    Нам нужен только basename внутри queue.
+    """
+    s = raw.strip()
+    s = s.lstrip("/")                 # '/id:...' -> 'id:...'
+    s = s.replace("\\", "/")          # на всякий случай
+    return pathlib.Path(s).name       # убрать любые директории
+
+
 def main(argv: Sequence[str] = tuple(sys.argv)) -> None:
     n_seeds_last_training: int = 0
     time_last_training: int = 0
@@ -224,8 +222,9 @@ def main(argv: Sequence[str] = tuple(sys.argv)) -> None:
     parser = create_parser()
     args = parser.parse_args(argv[1:])
 
-    # Configure logger - file
     seeds_path = pathlib.Path(args.seeds)
+
+    # Configure logger - file
     file_logger = logging.FileHandler(seeds_path.parent / "training.log")
     file_logger.setFormatter(log_formatter)
     logger.addHandler(file_logger)
@@ -239,8 +238,7 @@ def main(argv: Sequence[str] = tuple(sys.argv)) -> None:
     # Validate inputs
     if args.percentile_len <= 0 or args.percentile_len > 100:
         raise ValueError(
-            f"Invalid `percentile_len`. "
-            f"Expected integer in [1, 100], received: {args.percentile_len}."
+            f"Invalid `percentile_len`. Expected integer in [1, 100], received: {args.percentile_len}."
         )
     if args.val_split < 0.0 or args.val_split >= 1.0:
         raise ValueError(
@@ -248,39 +246,45 @@ def main(argv: Sequence[str] = tuple(sys.argv)) -> None:
         )
     create_work_folders(seeds_path.parent)
 
-    data_loader = CoverageSeedHandler(  # Only edge coverage supported for now
+    data_loader = CoverageSeedHandler(
         seeds_path,
         args.target,
         args.max_len,
         args.percentile_len,
         args.val_split,
     )
+
     model: Optional[MLP] = None
-    out_pipe = open(output_pipe, "w")
-    max_grads = os.environ.get("NEUZZPP_MAX_GRADS")
-    n_grads = None if max_grads is None else int(max_grads)
-    with open(input_pipe, "r") as seed_fifo:
-        for seed_name in seed_fifo:
+
+    # Важно: писать в pipe построчно и flush, иначе mutator/AFL зависнут
+    with open(output_pipe, "w") as out_pipe, open(input_pipe, "r") as seed_fifo:
+        for seed_line in seed_fifo:
             # (Re-)train model if necessary
-            if (
-                model_needs_retraining(seeds_path, time_last_training, n_seeds_last_training)
-                or model is None
-            ):
-                # Update info for model retraining
+            if model_needs_retraining(seeds_path, time_last_training, n_seeds_last_training) or model is None:
                 n_seeds_last_training = len(list(seeds_path.glob("id*")))
                 time_last_training = int(time.time())
 
-                model = train_model(args, data_loader)
-                grad_model = create_logits_model(model)
+                trained = train_model(args, data_loader)
+                grad_model = create_logits_model(trained)
+                model = trained  # keep non-None marker
 
-            # Generate gradients for requested seed
-            target_path = pathlib.Path(str(seeds_path) + seed_name.strip())
+            # Normalize seed name from AFL pipe
+            seed_file = _normalize_seed_name(seed_line)
+            target_path = seeds_path / seed_file
+
+            if not target_path.exists():
+                # Не падаем! Иначе afl-мутатор отвалится.
+                logger.warning(f"Requested seed does not exist: raw='{seed_line.strip()}' -> '{target_path}'")
+                # Отдадим хотя бы минимально валидную строку, чтобы AFL не повис в ожидании.
+                out_pipe.write("0|0\n")
+                out_pipe.flush()
+                continue
+
             sorting_index_lst, gradient_lst = compute_one_mutation_info(
-                grad_model, target_path, n_grads
+                grad_model, target_path, os.environ.get("NEUZZPP_MAX_GRADS") and int(os.environ["NEUZZPP_MAX_GRADS"])
             )
             out_pipe.write(",".join(sorting_index_lst) + "|" + ",".join(gradient_lst) + "\n")
             out_pipe.flush()
-    out_pipe.close()
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ class MLP:
     """
     Basic MLP with one hidden layer as used in the original NEUZZ implementation.
 
-    The output layer is a sigmoid (not softmax), as predictions are coverage bitmaps.
+    Output is sigmoid (multi-label bitmap).
     """
 
     def __init__(
@@ -36,29 +36,24 @@ class MLP:
         output_bias: Optional[float] = None,
         fast: bool = False,
     ) -> None:
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        if output_bias is not None:
-            output_bias = tf.keras.initializers.Constant(output_bias)
-        self.output_bias = output_bias
-        self.ff_dim = ff_dim
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
 
-        # Create model
-        model = tf.keras.models.Sequential()
-        model.add(layers.Dense(ff_dim, input_dim=input_dim, activation="relu"))
-        model.add(layers.Dense(output_dim, bias_initializer=output_bias, name="logits"))
-        model.add(layers.Activation("sigmoid"))
+        bias_init = None
+        if output_bias is not None:
+            bias_init = tf.keras.initializers.Constant(float(output_bias))
+
+        # Keras-3-safe model construction: define Input explicitly
+        inputs = tf.keras.Input(shape=(self.input_dim,), dtype=tf.float32, name="seed_bytes")
+        x = layers.Dense(ff_dim, activation="relu")(inputs)
+        logits = layers.Dense(self.output_dim, bias_initializer=bias_init, name="logits")(x)
+        outputs = layers.Activation("sigmoid")(logits)
+        model = tf.keras.Model(inputs=inputs, outputs=outputs, name="neuzzpp_mlp")
 
         # Compile
-        lr = tf.keras.optimizers.schedules.CosineDecayRestarts(lr, first_decay_steps=1000)
-        # lr = CyclicalLearningRate(
-        #     initial_learning_rate=1e-6,
-        #     maximal_learning_rate=lr,
-        #     step_size=2 * (seed_handler.training_size // batch_size + 1),
-        #     scale_fn=lambda x: 1 / (2.0 ** (x - 1)),
-        #     scale_mode="cycle",
-        # )
-        optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+        lr_sched = tf.keras.optimizers.schedules.CosineDecayRestarts(lr, first_decay_steps=1000)
+        optimizer = tf.keras.optimizers.Adam(learning_rate=lr_sched)
+
         metrics = [
             tf.keras.metrics.AUC(
                 name="prc", curve="PR", multi_label=True, num_labels=self.output_dim
@@ -80,35 +75,25 @@ class MLP:
         self.model = model
 
 
-def create_logits_model(model):
+def create_logits_model(model: tf.keras.Model) -> tf.keras.Model:
     """
-    Create a model that outputs logits instead of probabilities for mutation gradient computation.
-
-    The assumption is that the input model has a layer called `logits`, which will be used for
-    creating the gradient model.
-
-    Args:
-        model: Trained model capable of predicting bitmap coverage for the
-            target program. Outputs are probabilities.
-
-    Returns:
-        A new model of shared input and weights as the original, but that outputs the logits
-        before the last activation layer.
+    Create a model that outputs logits (pre-sigmoid) for gradient computation.
+    Works reliably with Keras 2.x and 3.x.
     """
-    return tf.keras.models.Model(inputs=model.input, outputs=model.get_layer("logits").output)
+    try:
+        logits_layer = model.get_layer("logits")
+    except Exception as e:
+        raise ValueError("Expected a layer named 'logits' in the model, but it was not found.") from e
+
+    # Use model.inputs (list) - stable in Keras 3
+    return tf.keras.Model(inputs=model.inputs, outputs=logits_layer.output, name="neuzzpp_logits")
 
 
-def predict_coverage(model: tf.keras.models.Model, inputs: List[np.ndarray]) -> np.ndarray:
+def predict_coverage(model: tf.keras.Model, inputs: List[np.ndarray]) -> np.ndarray:
     """
     Get binary labels from model for non-normalized input data.
-
-    The input data is first normalized and preprocessed to the length required by the model.
-
-    Args:
-        model: Keras model predicting coverage bitmap from program input.
-        inputs: List or equivalent of non-normalized inputs.
     """
-    input_shape = model.input.shape[-1]
+    input_shape = int(model.inputs[0].shape[-1])
     inputs_preproc = tf.keras.preprocessing.sequence.pad_sequences(
         inputs, padding="post", dtype="float32", maxlen=input_shape
     )

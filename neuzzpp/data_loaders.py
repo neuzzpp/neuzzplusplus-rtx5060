@@ -179,17 +179,33 @@ class SeedFolderHandler:
         Returns:
             Class weights dict for classes 0 and 1, along with the initial bias.
         """
-        n_neg = np.count_nonzero(self.training_set[1] == 0)
-        n_total = self.training_set[1].size
-        n_pos = n_total - n_neg
-        weight_for_uncovered = (1.0 / n_neg) * (n_total / 2.0)
-        weight_for_covered = (1.0 / n_pos) * (n_total / 2.0)
-        class_weights = {0: weight_for_uncovered, 1: weight_for_covered}
-        initial_bias = float(np.log([n_pos / n_neg]))
+        n_neg = int(np.count_nonzero(self.training_set[1] == 0))
+        n_total = int(self.training_set[1].size)
+        n_pos = int(n_total - n_neg)
+
+        # Guard against degenerate datasets (all-zeros or all-ones)
+        # Keep behavior stable rather than crashing with division by zero.
+        if n_neg == 0 or n_pos == 0:
+            logger.warning(
+                "Degenerate dataset for class weights (n_neg=%s, n_pos=%s). "
+                "Falling back to neutral weights/bias.",
+                n_neg,
+                n_pos,
+            )
+            class_weights = {0: 1.0, 1: 1.0}
+            initial_bias = 0.0
+        else:
+            weight_for_uncovered = (1.0 / n_neg) * (n_total / 2.0)
+            weight_for_covered = (1.0 / n_pos) * (n_total / 2.0)
+            class_weights = {0: weight_for_uncovered, 1: weight_for_covered}
+
+            # IMPORTANT: log() must be applied to a scalar, not a 1-element array.
+            ratio = n_pos / n_neg
+            initial_bias = float(np.log(ratio))
 
         logger.info(
             "Dataset:\n    Total: {}\n    Positive: {} ({:.2f}% of total)\n".format(
-                n_total, n_pos, 100 * n_pos / n_total
+                n_total, n_pos, 100 * n_pos / n_total if n_total else 0.0
             )
         )
 
