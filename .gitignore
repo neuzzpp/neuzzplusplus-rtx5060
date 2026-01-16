@@ -30,3 +30,6 @@ env/
 # AFL outputs / tmp
 /tmp/gs_in/
 /tmp/gs_out/
+
+# local deps (AFL++, builds, etc)
+.deps/
