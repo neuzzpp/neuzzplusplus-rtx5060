@@ -1,146 +1,207 @@
-# Neuzz++ - Neural program smoothing for fuzzing in AFL++
+# neuzzplusplus-rtx5060 (Docker + TensorFlow/Keras 3, RTX 5060)
 
-Neuzz++ is an implementation of neural program smoothing for fuzzing as AFL++ custom mutator.
-The mutator is implemented in C and interacts with Python for training a machine learning model and generating mutations.
-This is the companion code for the Neuzz++ method reported in the paper ["Revisiting Neural Program Smoothing for Fuzzing"](https://arxiv.org/abs/2309.16618) presented at ESEC/FSE'23.
-See also the [MLFuzz benchmarking framework](https://github.com/boschresearch/mlfuzz) introduced in the same paper.
+This repo is a fork of `boschresearch/neuzzplusplus` updated to run **inside Docker** on
+**RTX 5060** with a **new TensorFlow / Keras 3 stack**.
 
-## Installation
+It wires **AFL++** to a **custom ML mutator** (`libml-mutator.so`) that talks to
+`scripts/train_cov_oracle.py` over **named pipes (FIFOs)**.
 
-### Installing AFL++
+---
 
-Neuzz++ is implemented as a custom mutator for AFL++, so it requires this fuzzer to be installed.
-For reproducing experimental results from the paper, we recommend using the AFL++ version specified by the commit hash below.
-We provide two alternative installation options:
-* Either clone and compile AFL++ from source in the folder of your choice:
+## 1) Requirements (host)
 
-      git clone https://github.com/AFLplusplus/AFLplusplus
-      cd AFLplusplus/
-      git checkout 9e2a94532b7fd5191de905a8464176114ee7d258
-      make
+- Linux + NVIDIA driver installed
+- Docker + NVIDIA Container Toolkit
+- An NVIDIA GPU (RTX 5060 in this setup)
 
-* Or install from Ubuntu repositories:
+Quick GPU check:
 
-      sudo apt install afl++
+```bash
+nvidia-smi
+```
 
-### Install Python dependencies
+---
 
-This project uses `python>=3.8` and [`poetry`](https://python-poetry.org/) for managing the Python environment.
-Install `poetry` system-wide or in an empty virtual environment (e.g., created via `virtualenv` or `conda`).
-Then run
+## 2) Build the Docker image
 
-    poetry install --without dev
+From the repo root:
 
-to install the project dependencies.
-Note that Neuzz++ and MLFuzz have the same Pythhon dependencies; you only need to create one virtual environment for both of them.
-Use
+```bash
+docker build -t neuzzpp:cuda128 .
+```
 
-    poetry shell
+---
 
-to activate the environment.
+## 3) Run the dev container
 
-### Build Neuzz++ custom mutator
+### Create a new container
 
-In the cloned `NEUZZplusplus` folder, run:
+```bash
+docker run -it --gpus all \
+  --name neuzzpp-dev \
+  -v "$PWD":/workspace \
+  neuzzpp:cuda128 bash
+```
 
-    make -C ./aflpp-plugins/
+### Reuse an existing container
 
-### Set environment variables
+```bash
+docker start -ai neuzzpp-dev
+```
 
-Finally, export the `AFL_PATH` and `NEUZZPP_PATH` pointing to the cloned repos:
+---
 
-    export AFL_PATH=/path/to/AFLplusplus/
-    export NEUZZPP_PATH=/path/to/NEUZZplusplus/
+## 4) Verify the Python/TensorFlow environment (inside the container)
 
-You are now ready to use Neuzz++.
+```bash
+which python
+python -c "import tensorflow as tf; print('TF', tf.__version__)"
+python -c "import keras; print('Keras', keras.__version__)" || true
+python -c "import sklearn; print('sklearn ok', sklearn.__version__)" || true
 
-## Usage
+# If you use Poetry in this repo:
+poetry run python -c "import tensorflow as tf; print('TF', tf.__version__)"
+poetry run python -c "import sklearn; print('sklearn ok', sklearn.__version__)"
+```
 
-### Basic usage
+---
 
-Running Neuzz++ is done by running AFL++'s fuzzing command `afl-fuzz` with the custom mutator environment variable `AFL_CUSTOM_MUTATOR_LIBRARY` pointing at the library built in previous steps (`./aflpp-plugins/libml-mutator.so`).
-All standard AFL++ options can be used in conjunction with Neuzz++; please see the AFL++ [official page](https://aflplus.plus/) for more information on these and on building targets for fuzzing.
-In the following, we provide a basic usage example.
+## 5) Run AFL++ with the ML custom mutator
 
-**Note** Neuzz++ requires enabling the AFL++ `AFL_DISABLE_TRIM=1` option (e.g., by using environment variables).
+### 5.1 Prepare input seeds
 
-In the Neuzz++ base folder, activate the Python virtual environment by calling:
+Put some initial seeds in a folder (example):
 
-    poetry shell
+```bash
+mkdir -p /tmp/in_seeds
+cp -n ./path/to/your/seeds/* /tmp/in_seeds/ 2>/dev/null || true
+ls -la /tmp/in_seeds | head
+```
 
-or the appropriate command for your environment management tool.
-To fuzz a target program called `target` available in the current folder, run:
+### 5.2 Set environment for the custom mutator
 
-    AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 AFL_FORKSRV_INIT_TMOUT=1000 AFL_DISABLE_TRIM=1 AFL_CUSTOM_MUTATOR_LIBRARY=./aflpp-plugins/libml-mutator.so \
-    afl-fuzz -i input -o output -m none -- ./target
+```bash
+export AFL_PATH=/workspace/.deps/AFLplusplus
+export AFL_CUSTOM_MUTATOR_LIBRARY=/workspace/aflpp-plugins/libml-mutator.so
 
-If any valid inputs for the target program are available (also known as *seeds*), place them in the `input` folder.
-The results of the fuzzing campaign will be stored in the `output` folder.
-The fuzzed program does not have to be in the current folder; just use the correct relative path.
-Note that the target needs to be built with [AFL++ instrumentation](https://aflplus.plus/docs/fuzzing_in_depth/#1-instrumenting-the-target) for fuzzing.
-To run the experiment for a fixed duration, use the `-V` option, followed by the duration in seconds (e.g., `-V 86400` will fuzz for 24 hours).
-The `input`, `output` and `target` paths can be customized to the user's needs.
+# Optional but common for Docker:
+export AFL_SKIP_CPUFREQ=1
+export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
+```
 
-The maximum number of gradients that should be used for mutations can be set via the environment variable `NEUZZPP_MAX_GRADS`.
-The default value is `NEUZZPP_MAX_GRADS=32`; this value is used in the paper and is validated experimentally for a good performance-speed trade-off.
+### 5.3 Run `afl-fuzz`
 
-### Framework usage
+Replace `./target_binary ... @@` with your real target command.
+Make sure `@@` is present.
 
-Neuzz++ is integrated with the open-source fuzzing framework [MLFuzz](../MLFuzz/README.md), which allows to run containerized, large-scale fuzzing experiments on standard target programs.
-Please see MLFuzz [setup](../MLFuzz/README.md#setup) and [usage instructions](../MLFuzz/README.md#usage) for more details.
+```bash
+$AFL_PATH/afl-fuzz -i /tmp/in_seeds -o /tmp/out_afl -m none -t 3000+ \
+  -- ./target_binary --some-arg @@
+```
 
-### Fuzzing output
+AFL++ will create a session like:
 
-At the end of a Neuzz++ fuzzing run, the `output` folder will contain the following information:
+```text
+/tmp/out_afl/default/
+  queue/
+  crashes/
+  hangs/
+  pipe_to_ml_model
+  pipe_from_ml_model
+  training.log
+```
 
-    output
-    ├── crashes           # Folder that containing inputs that trigger crashes on the target
-    ├── fuzzer_config     # AFL++ config for this run
-    ├── fuzzer_stats      # Statistics of the fuzzing campaign
-    ├── models            # Folder storing machine learning models if the option was enabled in the Python script
-    ├── plot_data         # CSV data regarding fuzzing progression and coverage over (relative) time
-    └── queue             # Corpus of all interesting inputs found by the fuzzer
+If everything is wired correctly, after enough seeds are available the ML side will train,
+then the AFL++ status line should eventually show activity under the `py/custom/...` counters.
 
-## Project structure
+---
 
-Neuzz++ follows a standard Python package structure.
+## 6) Debug checklist (when ML training/mutations look “stuck”)
 
-    NEUZZplusplus/
-    ├── aflpp-plugins/          # Neuzz++ custom mutator for AFL++ linking to Python code for ML 
-    ├── docs/                   # Sphinx documentation sources
-    ├── neuzzpp/                # Python package with reusable ML logic
-    ├── notebooks/              # Jupyter notebooks reproducing mutations effectiveness analysis
-    ├── scripts/                # Scripts folder with Neuzz++ ML code used by AFL++ custom mutator
-    ├── LICENSE                 # License file
-    ├── poetry.lock             # Project requirements in Poetry format
-    ├── pyproject.toml          # Standard Python package description for pip
-    └── README.md               # The present README file
+These commands help you verify that:
+- the FIFOs exist,
+- both sides have them open,
+- AFL++ is writing seed requests,
+- the training process can resolve seed paths.
 
-## Citation
+### 6.1 Check the AFL++ session + FIFOs
 
-If you use Neuzz++ in scientific work, consider citing our paper presented at ESEC/FSE '23:
+```bash
+OUT=/tmp/out_afl/default
+ls -la "$OUT"
+ls -la "$OUT/pipe_to_ml_model" "$OUT/pipe_from_ml_model"
 
-    Maria-Irina Nicolae, Max Eisele, and Andreas Zeller. “Revisiting Neural Program Smoothing for Fuzzing”. In Proceedings of the 31st ACM Joint European Software Engineering Conference and Symposium on the Foundations of Software Engineering. ACM, Dec. 2023.
+# Quick sanity: FIFOs should show as 'p' in permissions (prw...)
+stat "$OUT/pipe_to_ml_model" "$OUT/pipe_from_ml_model"
+```
 
-<details>
-<summary>BibTeX</summary>
+### 6.2 Confirm both processes have the pipes open
 
-  ```bibtex
-  @inproceedings {NEUZZplusplus23,
-  author = {Maria-Irina Nicolae, Max Eisele, and Andreas Zellere},
-  title = {Revisiting Neural Program Smoothing for Fuzzing},
-  booktitle = {Proceedings of the 31st ACM Joint European Software Engineering Conference and Symposium on the Foundations of Software Engineering (ESEC/FSE)},
-  year = {2023},
-  publisher = {{ACM}},
-  doi = {10.1145/3468264.3473932},
-  month = dec,
-  }
-  ```
+```bash
+# AFL pid (from fuzzer_stats)
+cat "$OUT/fuzzer_stats" | grep '^fuzzer_pid'
+AFL_PID=$(awk -F': ' '/^fuzzer_pid/ {print $2}' "$OUT/fuzzer_stats")
 
-</details>
+# ML training pid
+ps aux | grep -E "train_cov_oracle.py" | grep -v grep
+ML_PID=$(ps aux | awk '/train_cov_oracle\.py/ && !/awk/ {print $2; exit}')
 
-## License
+# Pipe FDs must appear in BOTH processes
+ls -l /proc/$AFL_PID/fd | grep -E 'pipe_(to|from)_ml_model' || true
+ls -l /proc/$ML_PID/fd  | grep -E 'pipe_(to|from)_ml_model' || true
+```
 
-Copyright (c) 2023 Robert Bosch GmbH and its subsidiaries.
-Neuzz++ is distributed under the AGPL-3.0 license.
-See the [LICENSE](LICENSE) for details.
+### 6.3 Inspect training logs
+
+```bash
+tail -n 200 "$OUT/training.log"
+grep -nE "Traceback|ERROR|Exception" "$OUT/training.log" | tail -n 50
+```
+
+### 6.4 Verify that a requested seed actually exists
+
+If you see errors like `FileNotFoundError: ... '/id:000013,...'`, the usual cause is
+an incorrect join between `seeds_path` and the FIFO line.
+
+Check the actual seed path:
+
+```bash
+ls -la "$OUT/queue" | head
+ls -la "$OUT/queue"/id:* | head
+```
+
+### 6.5 Peek at FIFO traffic (non-destructive)
+
+These can block if nobody is writing/reading; use `timeout`.
+
+```bash
+# See if AFL is writing something into the pipe (may block if empty)
+timeout 1s head -n 5 "$OUT/pipe_to_ml_model" | cat -A || true
+```
+
+### 6.6 Run training manually (only for debugging)
+
+This is useful to isolate Python/TensorFlow issues from AFL++.
+
+```bash
+OUT=/tmp/out_afl/default
+poetry run python ./scripts/train_cov_oracle.py -f -s 10 \
+  "$OUT/pipe_to_ml_model" \
+  "$OUT/pipe_from_ml_model" \
+  "$OUT/queue" \
+  -- ./target_binary --some-arg @@
+```
+
+> Note: manual training requires the FIFOs to exist (`mkfifo` is done by the mutator setup).
+> If you run training standalone, you can create them yourself:
+>
+> ```bash
+> mkfifo "$OUT/pipe_to_ml_model" "$OUT/pipe_from_ml_model"
+> ```
+
+---
+
+## License / upstream
+
+- Upstream project: `boschresearch/neuzzplusplus`
+- Original license headers are preserved in the source files.
